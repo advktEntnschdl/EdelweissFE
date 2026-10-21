@@ -207,6 +207,7 @@ _addBuiltins(
         "bodyforce",
         "changematerialproperty",
         "dirichlet",
+        "dissipationcontrol",
         "distributedload",
         "geostatic",
         "indirectcontractioncontrol",
