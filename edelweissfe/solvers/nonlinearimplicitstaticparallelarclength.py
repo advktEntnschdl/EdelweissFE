@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from edelweissfe.config import registry
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.dofmanager import DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
@@ -85,6 +86,9 @@ class NISTPArcLength(NISTParallel):
         self.Lambda = 0.0
         self.dLambda = 0.0
         self.arcLengthController = None
+        # last accepted increment, for extrapolating also after a cutback (controllers with getExtrapolationFactor)
+        self._lastAcceptedTimeStep = None
+        self._lastAcceptedDU = None
         # arcLengthController/stopCondition are not consulted through self.options -- beginStep
         # reads them from here directly, every step, unconditionally (see applyOptionsOverride).
         self._arcLengthOptions = {}
@@ -134,6 +138,8 @@ class NISTPArcLength(NISTParallel):
         self.validateModelCapabilities(model)
 
         self.arcLengthController = None
+        self._lastAcceptedTimeStep = None
+        self._lastAcceptedDU = None
         self.checkConditionalStop = lambda: False
 
         if "arc length parameter" in model.additionalParameters:
@@ -147,8 +153,13 @@ class NISTPArcLength(NISTParallel):
         if arcLengthControllerOptions:
             arcLengthController = arcLengthControllerOptions.get("arcLengthController")
             if arcLengthController:
+                # the option names the controlling step action module; unknown values (e.g. 'off') fall back to
+                # the legacy indirectcontrol
+                controllerModule = arcLengthController.lower()
+                if not registry.isRegistered("stepaction", controllerModule):
+                    controllerModule = "indirectcontrol"
                 try:
-                    arcLengthControllerStepAction = [action for action in step.actions["indirectcontrol"].values()][0]
+                    arcLengthControllerStepAction = [action for action in step.actions[controllerModule].values()][0]
                     self.arcLengthController = arcLengthControllerStepAction
                     self.dLambda = 0.0
                 except (KeyError, IndexError):
@@ -329,21 +340,30 @@ class NISTPArcLength(NISTParallel):
             K[:] += K_0
             K[:] += (Lambda + dLambda) * K_f
 
-            # Dirichlets ..
-            if isExtrapolatedIncrement and iterationCounter == 0:
-                R_0 = self.applyDirichletToResidual(zeroTimeStep, R_0, dirichlets)
-            else:
-                modifiedTimeStep = TimeStep(timeStep.number, dLambda, Lambda + dLambda, 0.0, 0.0, 0.0)
-                R_0 = self.applyDirichletToResidual(modifiedTimeStep, R_0, dirichlets)
+            # Dirichlets: the constrained DOFs follow the load parameter, so their correction is the
+            # prescribed increment for dLambda minus the increment already applied (plus ddLambda times R_f)
+            modifiedTimeStep = TimeStep(timeStep.number, dLambda, Lambda + dLambda, 0.0, 0.0, 0.0)
+            R_0 = self.applyDirichletToResidual(modifiedTimeStep, R_0, dirichlets)
+            for dirichlet in dirichlets:
+                R_0[dirichlet.constrainedDofIndices] -= dU[dirichlet.constrainedDofIndices]
 
             R_f = self.applyDirichletToResidual(referenceTimeStep, R_f, dirichlets)
+
+            if hasattr(self.arcLengthController, "setSystemState"):
+                # prescribed reference increment of the constrained DOFs, conjugate to their reactions
+                uHat = np.zeros_like(R_f)
+                for dirichlet in dirichlets:
+                    uHat[dirichlet.constrainedDofIndices] = R_f[dirichlet.constrainedDofIndices]
 
             if iterationCounter > 0 or isExtrapolatedIncrement:
                 converged, nodesWithLargestResidual = self.checkConvergence(
                     R_0, ddU, dU, F, FConstraints, iterationCounter, incrementResidualHistory
                 )
 
-                if converged:
+                # a nonlinear constraint is only linearized, so it has to be checked as well
+                if converged and getattr(self.arcLengthController, "isConstraintSatisfied", lambda *args: True)(
+                    timeStep, dU, self.theDofManager
+                ):
                     break
 
                 if self.checkDivergingSolution(incrementResidualHistory, maxGrowingIter):
@@ -355,6 +375,9 @@ class NISTPArcLength(NISTParallel):
                     raise ReachedMaxIterations("Reached max. iterations in current increment, cutting back")
 
             K_ = self.assembleStiffnessCSR(K)
+            if hasattr(self.arcLengthController, "setSystemState"):
+                # before the Dirichlet BCs overwrite the rows of the constrained DOFs
+                self.arcLengthController.setSystemState(P, uHat, Lambda, dLambda, K_)
             # identity rows, and the columns eliminated into both right-hand sides R_0 and R_f
             K_ = self.applyDirichletToStiffness(K_, dirichlets, R_)
 
@@ -375,11 +398,14 @@ class NISTPArcLength(NISTParallel):
 
             iterationCounter += 1
 
+        if hasattr(self.arcLengthController, "setSystemState"):
+            self.arcLengthController.setSystemState(P, uHat, Lambda, dLambda)
+
         self.Lambda += dLambda
         self.dLambda = dLambda
 
         self.arcLengthController.finishIncrement(U_n, dU, dLambda, timeStep, self.theDofManager)
-        model.additionalParameters["additionalParameters"] = self.Lambda
+        model.additionalParameters["arc length parameter"] = self.Lambda
 
         for stepActionType in stepActions.values():
             for action in stepActionType.values():
@@ -432,6 +458,20 @@ class NISTPArcLength(NISTParallel):
             # arclength control is inactive
             return super().extrapolateLastIncrement(extrapolation, timeStep, dU, dirichlets, prevTimeStep, model)
 
+        elif (
+            extrapolation == "linear"
+            and hasattr(self.arcLengthController, "getExtrapolationFactor")
+            and self._lastAcceptedTimeStep is not None
+            and self._lastAcceptedTimeStep.stepProgressIncrement
+            and self._lastAcceptedDU is not None
+            and self._lastAcceptedDU.shape == dU.shape
+        ):
+            # also after a cutback, since a zero predictor may follow an elastic unloading branch
+            factor = self.arcLengthController.getExtrapolationFactor(timeStep, self._lastAcceptedTimeStep)
+            dLambda = dLambda * factor
+            dU[:] = factor * self._lastAcceptedDU
+            isExtrapolatedIncrement = True
+
         elif extrapolation == "linear" and prevTimeStep and prevTimeStep.stepProgressIncrement:
             dLambda = dLambda * (timeStep.stepProgressIncrement / prevTimeStep.stepProgressIncrement)
             dU, isExtrapolatedIncrement = super().extrapolateLastIncrement(
@@ -443,6 +483,24 @@ class NISTPArcLength(NISTParallel):
             isExtrapolatedIncrement = False
 
         return dU, isExtrapolatedIncrement, dLambda
+
+    def acceptIncrement(self, step, model: FEModel, timeStep: TimeStep):
+        """Commit the converged increment, and keep it for the predictor of the next increment.
+
+        Parameters
+        ----------
+        step
+            The step being solved.
+        model
+            The model tree.
+        timeStep
+            The converged increment.
+        """
+
+        super().acceptIncrement(step, model, timeStep)
+
+        self._lastAcceptedTimeStep = timeStep
+        self._lastAcceptedDU = np.array(self._dU, copy=True)
 
     def applyStepActionsAtStepEnd(self, model, stepActions: dict[str, StepActionBase]):
         """Called when all step actions should finish a step.
