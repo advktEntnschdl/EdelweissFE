@@ -29,7 +29,6 @@
 
 # @author: Matthias Neuner
 
-import json
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -37,11 +36,12 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 import edelweissfe.utils.performancetiming as performancetiming
-from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
+from edelweissfe.config.linsolve import createLinearSolver
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.csrgeneratorv2 import CSRGenerator
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
+from edelweissfe.numerics.parallelizationutilities import forEachSliceInParallel
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
 from edelweissfe.solvers.base.convergencecriteria import (
     AbaqusConvergenceCriterion,
@@ -110,9 +110,13 @@ class NISTSchema:
         dtype=bool,
         default=False,
     )
-    linsolver: str | None = schemaField(description="The linear solver to be used.", dtype=str, default="pardiso")
-    linsolverConfigFile: str | None = schemaField(
-        description="A JSON configuration file for the linear solver.", dtype=str, default=""
+    linsolver: str | None = schemaField(
+        description=(
+            "The linear solver: the name of a *linearSolver block, or a type of linear solver with its defaults (e.g. "
+            "pardiso, superlu, blockamg)."
+        ),
+        dtype=str,
+        default="pardiso",
     )
     pruneCondensedMatrixZeros: bool | None = schemaField(
         description=(
@@ -137,15 +141,12 @@ class NISTSchema:
     )
     useThreadedMPCCondensation: bool | None = schemaField(
         description=(
-            "Condense the multi-point-constraint system matrix, T^T K T + C, with an OpenMP-threaded "
-            "kernel instead of SciPy's single-threaded CSR routines: every row of the result is computed "
-            "directly from the rows of K it combines, with no intermediate matrix, and rows of K that no "
-            "constraint touches are copied unchanged. The result does not depend on the number of "
-            "threads. Leaves more raw nnz than the "
-            "plain expression (explicit zeros are kept, SciPy's products drop exact-cancellation "
-            "zeros); applyDirichletToStiffness prunes them right after, gated by "
-            "pruneCondensedMatrixZeros (default auto: pruned for PARDISO, kept for blockamg, whose "
-            "hierarchy reuse needs a stable pattern). Off by default."
+            "Condense the multi-point-constraint system matrix, T^T K T + C, in place, with an "
+            "OpenMP-threaded kernel, instead of with SciPy's single-threaded CSR routines, which build a "
+            "second matrix. The CSR pattern of K gains, once per equation system, the entries where a "
+            "master collects the couplings of its slaves; the result does not depend on the number of "
+            "threads. Explicit zeros (the slave columns among them) are pruned from a copy according to "
+            "pruneCondensedMatrixZeros. Off by default."
         ),
         dtype=bool,
         default=False,
@@ -235,7 +236,6 @@ class NIST(NonlinearSolverBase):
         "extrapolateAfterModelChange": True,
         "equilibrateAfterModelChange": False,
         "linsolver": "",
-        "linsolverConfigFile": "",
         "pruneCondensedMatrixZeros": None,
         "useThreadedMPCCondensation": False,
         "report-performance-frequency": 0,
@@ -267,11 +267,41 @@ class NIST(NonlinearSolverBase):
         # the datalines of the *solver keyword belong exclusively to this solver, so unknown entries
         # are user typos and must not be swallowed
         self._updateOptions(kwargs, journal, strict=True)
+        #: The ``*linearSolver`` blocks of the input file by name, which linsolver= may name (none without an input file).
+        self.linearSolverDefinitions = jobInfo.get("linearSolvers", {})
+        #: The linear solver, and the ``linsolver`` it was made for (see :meth:`selectLinearSolverForStep`).
+        self.linSolver = None
+        self.linSolverName = None
 
         #: The last accepted increment, from which the predictor extrapolates (None: no extrapolation).
         self.prevTimeStep = None
         #: The solution increment of the last accepted increment.
         self.dU = None
+
+    def selectLinearSolverForStep(self) -> None:
+        """Make :attr:`linSolver` the linear solver the step about to begin names (``linsolver``): the one of the
+        previous step if it names the same, else a new one.
+
+        A kept solver builds anew for the step's equation system (``setModel``) and frees what it built before. A new
+        solver per step would leave the previous one to Python's cyclic garbage collector whenever its tree refers
+        back to itself (a function in a solver script, whose globals hold the tree), and the steps' matrices would
+        pile up."""
+        if self.linSolver is not None and self.options["linsolver"] == self.linSolverName:
+            return
+        # the previous one goes before the new one is made
+        self.linSolver = None
+        self.linSolver = createLinearSolver(self.options["linsolver"], self.linearSolverDefinitions)
+        self.linSolverName = self.options["linsolver"]
+        self.linSolver.setJournal(self.journal)
+
+    def forgetEquationSystem(self) -> None:
+        """Drop the equation system of the last build -- the DOF manager, the system matrix and its CSR generator,
+        the multi-point-constraint condensation, the DOF vectors -- so that it is gone before the next one is built,
+        never both at once."""
+        self.theDofManager = None
+        self.csrGenerator = None
+        self.mpcTransformation = None
+        self._U = self._dU = self._P = self._K = None
 
     def beginStep(
         self,
@@ -299,16 +329,7 @@ class NIST(NonlinearSolverBase):
         # so far: applyOptionsOverride pushes an override the moment such a block is constructed or
         # re-declared (edelweissfe.stepactions.options.StepAction), and an override sticks until
         # changed again -- there is nothing to reset or re-fetch here.
-        linsolverOptions = self.options["linsolverConfigFile"]
-        linsolverOptionDict = json.load(open(linsolverOptions, "r")) if linsolverOptions else ""
-        self.linSolver = (
-            getLinSolverByName(self.options["linsolver"], linsolverOptionDict)
-            if self.options["linsolver"]
-            else getDefaultLinSolver()
-        )
-        # Every registered linsolver inherits LinearSolver's setJournal() (a safe no-op-ish default for
-        # solvers that do not log), so this is unconditional -- no isinstance check needed.
-        self.linSolver.setJournal(self.journal)
+        self.selectLinearSolverForStep()
 
         convergenceCriterion = self.createConvergenceCriterion()
         convergenceCriterion.startStep(self.convergenceCriterion)
@@ -318,9 +339,7 @@ class NIST(NonlinearSolverBase):
         # start of whichever increment first needs it -- either the very first one, or any later
         # one where the topology update reports a change of the mesh or of a constraint's DOF
         # footprint (e.g. a dynamic contact candidate list).
-        self.theDofManager = None
-        self.mpcTransformation = None
-        self._U = self._dU = self._P = self._K = None
+        self.forgetEquationSystem()
 
         # The predictor's state between increments: the last accepted increment and its dU. A step
         # starts without; a resumed step then takes over the checkpointed ones.
@@ -331,6 +350,11 @@ class NIST(NonlinearSolverBase):
 
         self.applyStepActionsAtStepStart(model, step)
 
+        # The step's table reports its rows against this wall clock, so the two start together.
+        # Whatever was timed before the step -- a checkpoint's topology replay, a caller's own timed
+        # work -- would otherwise be counted in the rows but not in the wall clock, and the share
+        # left unaccounted would be off by that much: far below zero on a large refined model.
+        performancetiming.reset()
         self._stepWallClockTic = perf_counter()
 
     def prepareIncrement(self, step, model: FEModel, isRetry: bool):
@@ -388,7 +412,6 @@ class NIST(NonlinearSolverBase):
         cutbackFactor = step.cutbackFactor
         modelHasChanged = self._modelHasChanged
         connectivityHasChanged = self._connectivityHasChanged
-        U, dU, P, K = self._U, self._dU, self._P, self._K
 
         # The header of this increment's block (opened by the separator in prepareIncrement). Everything
         # about the solution -- an equation-system rebuild if one is needed, the MPC/Dirichlet
@@ -413,78 +436,93 @@ class NIST(NonlinearSolverBase):
             )
 
         if modelHasChanged or connectivityHasChanged or self.theDofManager is None:
-            self.theDofManager = DofManager(
-                model.nodeFields.values(),
-                model.scalarVariables.values(),
-                model.elements.values(),
-                model.constraints.values(),
-                model.nodeSets.values(),
-            )
-            # findDirichletIndices() keys its cache in part on self.theDofManager, so
-            # entries from the discarded manager would otherwise keep it (and everything
-            # it references) alive for the rest of the run.
-            self._dirichletIndicesCache = None
-            self.journal.message(
-                "eq. system rebuilt: {:} dof".format(self.theDofManager.nDof),
-                self.identification,
-                2,
-            )
-
-            # The per-field block extents, not just the total. Fields are laid out
-            # field-major in contiguous slices, so this states the block structure of the
-            # equation system -- which is what a field-split preconditioner needs, and what
-            # tells you at a glance how a coupled model's DOFs are actually distributed.
-            for fieldName, fieldIndices in self.theDofManager.idcsOfFieldsInDofVector.items():
+            with performancetiming.timeit("equation system rebuild"):
+                self.forgetEquationSystem()
+                with performancetiming.timeit("dof manager"):
+                    self.theDofManager = DofManager(
+                        model.nodeFields.values(),
+                        model.scalarVariables.values(),
+                        model.elements.values(),
+                        model.constraints.values(),
+                        model.nodeSets.values(),
+                    )
+                # findDirichletIndices() keys its cache in part on self.theDofManager, so
+                # entries from the discarded manager would otherwise keep it (and everything
+                # it references) alive for the rest of the run.
+                self._dirichletIndicesCache = None
                 self.journal.message(
-                    "field '{:}': {:} dof, [{:}, {:})".format(
-                        fieldName,
-                        fieldIndices.stop - fieldIndices.start,
-                        fieldIndices.start,
-                        fieldIndices.stop,
-                    ),
+                    "eq. system rebuilt: {:} dof".format(self.theDofManager.nDof),
                     self.identification,
                     2,
                 )
 
-            # The one interface point a solver needs beyond the plain (A, b) call: it
-            # derives whatever it wants (field layout, node coordinates, topology) from
-            # these itself. Re-pushed on every (re)build so it tracks the mesh across AMR.
-            self.linSolver.setModel(model, self.theDofManager)
+                # The per-field block extents, not just the total. Fields are laid out
+                # field-major in contiguous slices, so this states the block structure of the
+                # equation system -- which is what a field-split preconditioner needs, and what
+                # tells you at a glance how a coupled model's DOFs are actually distributed.
+                for fieldName, fieldIndices in self.theDofManager.idcsOfFieldsInDofVector.items():
+                    self.journal.message(
+                        "field '{:}': {:} dof, [{:}, {:})".format(
+                            fieldName,
+                            fieldIndices.stop - fieldIndices.start,
+                            fieldIndices.start,
+                            fieldIndices.stop,
+                        ),
+                        self.identification,
+                        2,
+                    )
 
-            presentVariableNames = list(self.theDofManager.idcsOfFieldsInDofVector.keys())
+                # The one interface point a solver needs beyond the plain (A, b) call: it
+                # derives whatever it wants (field layout, node coordinates, topology) from
+                # these itself. Re-pushed on every (re)build so it tracks the mesh across AMR.
+                with performancetiming.timeit("linear solver setup"):
+                    self.linSolver.setModel(model, self.theDofManager)
 
-            if self.theDofManager.idcsOfScalarVariablesInDofVector:
-                presentVariableNames += [
-                    "scalar variables",
-                ]
+                presentVariableNames = list(self.theDofManager.idcsOfFieldsInDofVector.keys())
 
-            self.convergenceTable = ConvergenceTable(presentVariableNames, self.linSolver.reportsSolveSummary)
+                if self.theDofManager.idcsOfScalarVariablesInDofVector:
+                    presentVariableNames += [
+                        "scalar variables",
+                    ]
 
-            K = self.theDofManager.constructVIJSystemMatrix()
-            self.csrGenerator = CSRGenerator(K)
+                self.convergenceTable = ConvergenceTable(presentVariableNames, self.linSolver.reportsSolveSummary)
 
-            U = self.theDofManager.constructDofVector()
-            P = self.theDofManager.constructDofVector()
-            dU = self.theDofManager.constructDofVector()
+                with performancetiming.timeit("system matrix pattern"):
+                    K = self.theDofManager.constructVIJSystemMatrix()
+                    self.csrGenerator = CSRGenerator(K)
 
-            for fieldName, field in model.nodeFields.items():
-                U = self.theDofManager.writeNodeFieldToDofVector(U, field, "U")
+                U = self.theDofManager.constructDofVector()
+                P = self.theDofManager.constructDofVector()
+                dU = self.theDofManager.constructDofVector()
 
-            for variable in model.scalarVariables.values():
-                U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]] = variable.value
+                for fieldName, field in model.nodeFields.items():
+                    U = self.theDofManager.writeNodeFieldToDofVector(U, field, "U")
 
-            self.mpcTransformation = self.buildMPCTransformation(model, step.actions)
-            self.checkMPCDirichletConflicts(self.mpcTransformation, step.actions)
+                for variable in model.scalarVariables.values():
+                    U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]] = variable.value
 
-            # After a change of the mesh or of the constraint connectivity, the last accepted
-            # dU belongs to a different DOF layout, so this one increment is not extrapolated
-            # -- the same fallback as after a failed increment. Otherwise (the first build of a
-            # step) the predictor continues from it.
-            if modelHasChanged or connectivityHasChanged:
-                self.prevTimeStep = None
-            elif self.dU is not None:
-                dU[:] = self.dU
-            self._U, self._dU, self._P, self._K = U, dU, P, K
+                with performancetiming.timeit("mpc transformation build"):
+                    self.mpcTransformation = self.buildMPCTransformation(model, step.actions)
+                with performancetiming.timeit("mpc dirichlet conflict check"):
+                    self.checkMPCDirichletConflicts(self.mpcTransformation, step.actions)
+                if self.mpcTransformation is not None:
+                    # Room in the CSR pattern for the entries the condensation adds, so that it can be done in place
+                    with performancetiming.timeit("mpc condensed pattern"):
+                        self.csrGenerator.addToPattern(
+                            self.mpcTransformation.condensedPatternFillIn(self.csrGenerator.csrMatrix)
+                        )
+
+                # After a change of the mesh or of the constraint connectivity, the last accepted
+                # dU belongs to a different DOF layout, so this one increment is not extrapolated
+                # -- the same fallback as after a failed increment. Otherwise (the first build of a
+                # step) the predictor continues from it.
+                if modelHasChanged or connectivityHasChanged:
+                    self.prevTimeStep = None
+                elif self.dU is not None:
+                    dU[:] = self.dU
+                self._U, self._dU, self._P, self._K = U, dU, P, K
+        # the equation system of this increment, just built or kept from the last one
+        U, dU, P, K = self._U, self._dU, self._P, self._K
 
         self.incrementStatus = {
             "step": step.number,
@@ -496,7 +534,7 @@ class NIST(NonlinearSolverBase):
             "notes": "",
         }
 
-        self.journal.preformatted(self.convergenceTable.headerLines(), self.identification, level=2)
+        self.tableHeaderWritten = False
 
         if modelHasChanged and equilibrateAfterModelChange:
             # Settle the warm-started refined mesh to equilibrium at the LAST converged load
@@ -590,6 +628,7 @@ class NIST(NonlinearSolverBase):
         self._U, self._dU, self._P = U, dU, P
         self._iterationCounter = iterationCounter
 
+    @performancetiming.timeit("accept increment")
     def acceptIncrement(self, step, model: FEModel, timeStep: TimeStep):
         """Commit the converged increment to the model, and keep the predictor's state; see
         :meth:`~edelweissfe.solvers.base.nonlinearsolverbase.NonlinearSolverBase.acceptIncrement`.
@@ -621,18 +660,19 @@ class NIST(NonlinearSolverBase):
         if iterationCounter >= step.criticalIter:
             step.timeStepper.preventIncrementIncrease()
 
-        # write results to nodes:
-        for fieldName, field in model.nodeFields.items():
-            self.theDofManager.writeDofVectorToNodeField(U, field, "U")
-            self.theDofManager.writeDofVectorToNodeField(P, field, "P")
-            self.theDofManager.writeDofVectorToNodeField(dU, field, "dU")
+        with performancetiming.timeit("write results to nodes"):
+            for fieldName, field in model.nodeFields.items():
+                self.theDofManager.writeDofVectorToNodeField(U, field, "U")
+                self.theDofManager.writeDofVectorToNodeField(P, field, "P")
+                self.theDofManager.writeDofVectorToNodeField(dU, field, "dU")
 
-        for variable in model.scalarVariables.values():
-            variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
+            for variable in model.scalarVariables.values():
+                variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
 
         self.updateRigidBodies(model, timeStep)
 
-        model.advanceToTime(timeStep.totalTime)
+        with performancetiming.timeit("advance model time"):
+            model.advanceToTime(timeStep.totalTime)
 
         self.journal.message(
             "Converged in {:} iteration(s)".format(iterationCounter),
@@ -759,25 +799,30 @@ class NIST(NonlinearSolverBase):
         distributedLoads = stepActions["distributedload"].values()
         bodyForces = stepActions["bodyforce"].values()
 
-        # Find which global DOFs the Dirichlet BCs constrain, once up front.
-        self.locateConstrainedDofs(dirichlets)
+        with performancetiming.timeit("step actions at increment start"):
+            # Find which global DOFs the Dirichlet BCs constrain, once up front.
+            self.locateConstrainedDofs(dirichlets)
 
-        self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
+            self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
 
         self.initializeIncrement(U_n, stepActions, model, timeStep)
 
-        dU, isExtrapolatedIncrement = self.extrapolateLastIncrement(
-            extrapolation, timeStep, dU, dirichlets, prevTimeStep, model
-        )
+        with performancetiming.timeit("predictor"):
+            dU, isExtrapolatedIncrement = self.extrapolateLastIncrement(
+                extrapolation, timeStep, dU, dirichlets, prevTimeStep, model
+            )
 
         while True:
             for geostatic in stepActions["geostatic"].values():
                 geostatic.applyAtIterationStart()
 
-            U_np[:] = U_n
-            U_np += dU
+            with performancetiming.timeit("reset residual and tangent"):
+                U_np[:] = U_n
+                U_np += dU
 
-            P[:] = K[:] = F[:] = FConstraints[:] = PExt[:] = 0.0
+                P[:] = F[:] = FConstraints[:] = PExt[:] = 0.0
+                # K holds the entries of all element matrices, far too many to zero on a single thread
+                forEachSliceInParallel(lambda s: K[s].fill(0.0), len(K))
 
             P, K, F = self.computeElements(elements, U_np, dU, P, K, F, timeStep)
             PExt, K = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_np, PExt, K, timeStep)
@@ -934,38 +979,16 @@ class NIST(NonlinearSolverBase):
         :func:`edelweissfe.solvers.base.dirichlet.applyDirichletToStiffness`."""
         K = applyDirichletToStiffness(K, dirichlets, rhs)
 
-        # Compacting the just-zeroed entries out of K is a storage/performance concern,
-        # not part of applying the boundary condition -- and whether it's even safe
-        # depends on K's identity, which only the assembler/solver side knows:
+        # Compacting the explicit zeros out of a condensed K (see _shouldPruneCondensedMatrixZeros): PARDISO's
+        # reordering of these poorly conditioned, path-dependent (contact/friction) systems is sensitive enough to
+        # the extra structural entries to drift from the reference path; but the pattern then changes from one
+        # Newton iteration to the next, so a solver like blockamg, which reuses its hierarchy, keeps them.
         #
-        # - No MPC transformation: K is self.csrGenerator's own persistent CSR matrix,
-        #   returned by reference (assembleStiffnessCSR/updateInPlace) and reused, in
-        #   place, every Newton iteration. eliminate_zeros() would shrink/compact its
-        #   data/indices arrays -- but the generator's C++ core scatters fresh values
-        #   into the ORIGINAL, full-length buffer on every subsequent update via a fixed
-        #   assembly map computed once at construction. After a shrink, that buffer and
-        #   the (now compacted) K.indices/K.indptr disagree about which stored slot
-        #   belongs to which (row, col) -- silently misaligned values from the next
-        #   iteration on. Must NOT eliminate.
-        # - MPC transformation active (hanging nodes / ties): K is the freshly computed,
-        #   disposable T^T @ K @ T + I_s from mpcTransformation.transformSystemMatrix,
-        #   independent of the generator's buffer and discarded after this solve.
-        #   Eliminating here is always safe, and PARDISO's reordering on these more
-        #   poorly conditioned, path-dependent (contact/friction) condensed systems is
-        #   sensitive enough to the extra explicit-zero structural entries to visibly
-        #   drift from the converged reference path if they are kept.
-        #
-        # The pruning has a measured cost, though, which is why it is now switchable: it removes
-        # whichever entries happen to be exactly zero on *this* iteration, so the pattern differs from
-        # one Newton iteration to the next (observed large swings in nnz within a single increment)
-        # and a linear solver can never reuse its symbolic factorization -- a non-trivial share of each
-        # iteration's cost on a large model. Turning it off is only half the story: it pays off solely in
-        # combination with a solver that then actually freezes its reordering, and the drift the
-        # comment above describes has to be re-checked against a reference load path before it is
-        # adopted. Left unset in the input file, this is decided automatically per self.linSolver
-        # (see _shouldPruneCondensedMatrixZeros): pruned for a solver like PARDISO that needs it,
-        # skipped for one like blockamg that needs the pattern stable instead.
+        # The CSR generator's own matrix (the threaded condensation works in place on it) must never be compacted:
+        # the generator scatters every update into its full-length buffer via a fixed map. A copy is pruned instead.
         if self.mpcTransformation is not None and self._shouldPruneCondensedMatrixZeros():
+            if K is self.csrGenerator.csrMatrix:
+                K = K.copy()
             K.eliminate_zeros()
 
         return K

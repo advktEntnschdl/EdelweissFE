@@ -26,13 +26,11 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-import json
 from dataclasses import dataclass
 
 import numpy as np
 
 import edelweissfe.utils.performancetiming as performancetiming
-from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
 from edelweissfe.config.timing import createTimingDict
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
@@ -172,9 +170,13 @@ class NESTSchema:
         default="on",
         optionName="runge-kutta-error-control",
     )
-    linsolver: str | None = schemaField(description="The linear solver to be used.", dtype=str, default="pardiso")
-    linsolverConfigFile: str | None = schemaField(
-        description="A JSON configuration file for the linear solver.", dtype=str, default=""
+    linsolver: str | None = schemaField(
+        description=(
+            "The linear solver: the name of a *linearSolver block, or a type of linear solver with its defaults (e.g. "
+            "pardiso, superlu, blockamg)."
+        ),
+        dtype=str,
+        default="pardiso",
     )
     # Inherited behaviour, so it needs an entry here too: NEST reuses NIST.applyDirichletK, which
     # reads this option, but replaces SolverSpecificOptions wholesale rather than extending it -- so
@@ -215,7 +217,6 @@ class NEST(NIST):
         "runge-kutta-error-tolerance": 1e-3,
         "runge-kutta-error-control": "on",
         "linsolver": "",
-        "linsolverConfigFile": "",
         "pruneCondensedMatrixZeros": None,
     }
 
@@ -229,6 +230,11 @@ class NEST(NIST):
         # the datalines of the *solver keyword belong exclusively to this solver, so unknown entries
         # are user typos and must not be swallowed
         self._updateOptions(kwargs, journal, strict=True)
+        #: The ``*linearSolver`` blocks of the input file by name, which linsolver= may name (none without an input file).
+        self.linearSolverDefinitions = jobInfo.get("linearSolvers", {})
+        #: The linear solver, and the ``linsolver`` it was made for (see :meth:`selectLinearSolverForStep`).
+        self.linSolver = None
+        self.linSolverName = None
 
     def beginStep(
         self,
@@ -252,6 +258,9 @@ class NEST(NIST):
             The output managers.
         """
 
+        # The step's table covers the step only; whatever was timed before it is not its row.
+        performancetiming.reset()
+
         self.validateModelCapabilities(model)
 
         for constraintName, constraint in model.constraints.items():
@@ -263,6 +272,7 @@ class NEST(NIST):
                 )
 
         self.journal.message("Creating monolithic equation system", self.identification, 0)
+        self.forgetEquationSystem()
         self.theDofManager = DofManager(
             model.nodeFields.values(),
             model.scalarVariables.values(),
@@ -290,23 +300,12 @@ class NEST(NIST):
 
         self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)
 
-        linsolverOptions = self.options["linsolverConfigFile"]
-        linsolverOptionDict = {}
-        if linsolverOptions:
-            with open(linsolverOptions, "r") as f:
-                linsolverOptionDict = json.load(f)
-        self.linSolver = (
-            getLinSolverByName(self.options["linsolver"], linsolverOptionDict)
-            if self.options["linsolver"]
-            else getDefaultLinSolver()
-        )
+        self.selectLinearSolverForStep()
         # NEST solves a linear system per Runge-Kutta stage (see solveIncrement, via the inherited
-        # linearSolve()), so its linear solver needs the same initialization NIST gives its own:
-        # setJournal for solvers that log, and setModel for solvers that derive anything beyond the
-        # plain (A, b) call -- a field-split solver such as blockamg raises without the field
-        # structure setModel supplies. NEST's equation system is built once here rather than being
-        # rebuilt on connectivity changes, so one call at construction is enough.
-        self.linSolver.setJournal(self.journal)
+        # linearSolve()), so its linear solver needs the setModel NIST gives its own: for solvers that
+        # derive anything beyond the plain (A, b) call -- a field-split solver such as blockamg raises
+        # without the field structure setModel supplies. NEST's equation system is built once per step here
+        # rather than being rebuilt on connectivity changes, so one call per step is enough.
         self.linSolver.setModel(model, self.theDofManager)
 
         U = self.theDofManager.constructDofVector()
