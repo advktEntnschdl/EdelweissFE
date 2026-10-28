@@ -853,6 +853,12 @@ _U3B_STEP_ACTION_SPECS = [
         "InitializeMaterialSchema",
     ),
     _StepActionRenderSpec(
+        "edelweissfe.stepactions.sectionforces",
+        "sectionforces",
+        "Section forces acting on a beam cross section.",
+        "SectionForcesSchema",
+    ),
+    _StepActionRenderSpec(
         "edelweissfe.stepactions.modelupdate",
         "modelupdate",
         "This step action may be used for updating the model at the beginning of a step.",
@@ -880,7 +886,7 @@ _U3B_STEP_ACTION_SPECS = [
         "SetInitialConditionsSchema",
     ),
 ]
-assert len(_U3B_STEP_ACTION_SPECS) == 12
+assert len(_U3B_STEP_ACTION_SPECS) == 13
 
 
 #: The number of step types (registry category "step") every step action's keyword is registered
@@ -982,5 +988,5 @@ def test_non_bracket_format_golden_section_is_now_fully_covered():
     coveredByStepActionTest = {spec.modpath for spec in _U3B_STEP_ACTION_SPECS}
     coveredByMeshplotTest = {"edelweissfe.outputmanagers.meshplot"}
     formerlyNonBracketFormat = coveredByStepActionTest | coveredByMeshplotTest
-    assert len(formerlyNonBracketFormat) == 13
+    assert len(formerlyNonBracketFormat) == 14
     assert _NON_BRACKET_FORMAT_WITH_GOLDEN_SECTION == frozenset()

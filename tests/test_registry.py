@@ -199,7 +199,8 @@ def test_builtin_lookup_matches_direct_import(category, name, moduleName, attrNa
 
 
 def test_element_category_covers_every_element_type_exactly():
-    """The ``element`` category's two name lists must equal ``elLibrary``'s key set, both ways.
+    """The ``element`` category's name lists must equal ``elLibrary``'s key set plus the cross section
+    element types, both ways.
 
     The registry holds those 42 element types as plain string literals, deliberately: importing
     ``elements.library`` to build the table would break the zero-eager-import property (a
@@ -211,14 +212,17 @@ def test_element_category_covers_every_element_type_exactly():
     ``getElementClass(..., "edelweiss")``, and a type in the registry that ``elLibrary`` has no
     quadrature data for would resolve to a formulation class whose ``__init__`` then raises.
     """
+    from edelweissfe.elements.beamsectionelement.shapefunctions import (
+        sectionElementTypes,
+    )
     from edelweissfe.elements.library import elLibrary
 
     registeredTypes = {name for (category, name) in registry._BUILTINS if category == "element"}
-    libraryTypes = {elType.casefold() for elType in elLibrary}
+    libraryTypes = {elType.casefold() for elType in elLibrary} | {elType.casefold() for elType in sectionElementTypes}
 
     assert registeredTypes - libraryTypes == set(), "registered element types absent from elLibrary"
     assert libraryTypes - registeredTypes == set(), "elLibrary element types absent from the registry"
-    assert len(registeredTypes) == 42
+    assert len(registeredTypes) == 48
 
 
 def test_case_insensitive_lookup():

@@ -1,0 +1,22 @@
+** Warping and shear deformations of a rectangular beam section (WARP2D8),
+** with the stresses due to Vz, Vy, Mxp and Mxs, see Kindmann & Kraus, figure 7.7.
+*material, name=linearelastic, id=steel, provider=edelweiss
+210000.0, 0.3
+
+*section, name=sec1, thickness=1.0, material=steel, type=plane
+all
+
+*job, name=beamSection, domain=2d
+*solver, solver=BeamSection, name=theSectionSolver
+
+*modelGenerator, generator=planeRectQuad, name=gen
+x0=-50, l=100.0, y0=-100, h=200.0, elType=WARP2D8, elProvider=edelweiss, nX=4, nY=8
+
+*fieldOutput
+>>perNode, elSet=all, field=warping, result=U, name=warping
+>>perNode, elSet=all, field=shear deformation, result=U, name=shearDeformation
+>>perElement, elSet=all, result=shear stress, name=shearStress, quadraturePoint=0, f(x)=x
+
+*step, solver=theSectionSolver
+maxInc=1.0
+>>sectionforces, name=forces, Vy=5e4, Vz=1e5, Mxp=1e6, Mxs=2e6

@@ -999,6 +999,40 @@ once ``name`` resolves to a concrete object, against *that object's own* ``type(
 < options > Adjust a solver's or output manager's own options mid-job. 'name' must be the name an already-declared *solver or *output block gave it; every other option is validated against that specific instance's own type.
   required arguments
     [name] The name of the already-declared solver or output manager this block configures. (<class 'str'>)
+===== module documentation: edelweissfe.stepactions.sectionforces =====
+The section forces for the stresses computed by the :class:`~edelweissfe.solvers.beamsection.BeamSection`
+solver. They refer to the principal axes of the section; Mxp, Mxs and Mw to the shear center.
+Unspecified forces are zero; within a step, the forces change linearly from those of the previous step.
+
+.. code-block:: edelweiss
+    :caption: Example:
+
+    *step, solver=theSectionSolver
+        >>sectionforces, name=forces, Vz=100.0, Mxp=2.5
+< sectionforces > Section forces acting on a beam cross section.
+  required arguments
+    [name] Name of the step action. (<class 'str'>)
+  optional arguments
+    [N] Normal force. (<class 'float'>, default = 0.0)
+    [Vy] Shear force in y direction. (<class 'float'>, default = 0.0)
+    [Vz] Shear force in z direction. (<class 'float'>, default = 0.0)
+    [My] Bending moment about the y axis. (<class 'float'>, default = 0.0)
+    [Mz] Bending moment about the z axis. (<class 'float'>, default = 0.0)
+    [Mxp] Primary torsion moment. (<class 'float'>, default = 0.0)
+    [Mxs] Secondary torsion moment. (<class 'float'>, default = 0.0)
+    [Mw] Warping bimoment. (<class 'float'>, default = 0.0)
+< sectionforces > Section forces acting on a beam cross section.
+  required arguments
+    [name] Name of the step action. (<class 'str'>)
+  optional arguments
+    [N] Normal force. (<class 'float'>, default = 0.0)
+    [Vy] Shear force in y direction. (<class 'float'>, default = 0.0)
+    [Vz] Shear force in z direction. (<class 'float'>, default = 0.0)
+    [My] Bending moment about the y axis. (<class 'float'>, default = 0.0)
+    [Mz] Bending moment about the z axis. (<class 'float'>, default = 0.0)
+    [Mxp] Primary torsion moment. (<class 'float'>, default = 0.0)
+    [Mxs] Secondary torsion moment. (<class 'float'>, default = 0.0)
+    [Mw] Warping bimoment. (<class 'float'>, default = 0.0)
 ===== module documentation: edelweissfe.stepactions.setfield =====
 < setfield > Set a field (via fieldOutput) to a predefined value.
   required arguments

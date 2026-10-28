@@ -540,6 +540,12 @@ _STEP_ACTION_SPECS = [
         "Standard distributed load, applied on a surface set.",
     ),
     _StepActionModuleSpec(
+        "edelweissfe.stepactions.sectionforces",
+        "sectionforces",
+        "sectionforces",
+        "Section forces acting on a beam cross section.",
+    ),
+    _StepActionModuleSpec(
         "edelweissfe.stepactions.modelupdate",
         "modelupdate",
         "modelupdate",

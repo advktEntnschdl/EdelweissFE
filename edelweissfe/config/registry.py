@@ -60,9 +60,9 @@ Built-in coverage
 ------------------
 The ``_BUILTINS`` table below covers these categories:
 
-``outputmanager`` (10), ``section`` (3), ``constraint`` (12), ``stepaction`` (13),
-``generator`` (11), ``analyticalfield`` (3), ``solver`` (7), ``step`` (2), ``modelmodifier`` (2),
-``statetransferstrategy`` (3), ``element`` (42), ``material`` (7), ``linsolver`` (10).
+``outputmanager`` (10), ``section`` (3), ``constraint`` (12), ``stepaction`` (14),
+``generator`` (11), ``analyticalfield`` (3), ``solver`` (10), ``step`` (2), ``modelmodifier`` (2),
+``statetransferstrategy`` (3), ``element`` (48), ``material`` (7), ``linsolver`` (10).
 
 ``keyword`` is the single source the ``.inp`` parser consults for every top-level keyword
 (``element``, ``node``, ``nSet``, ``elSet``, ``surface``, ``job``, ``section``, ``elementProperty``,
@@ -216,6 +216,7 @@ _addBuiltins(
         "modelupdate",
         "nodeforces",
         "options",
+        "sectionforces",
         "setfield",
         "setinitialconditions",
     ],
@@ -265,6 +266,7 @@ for _solverName, _target in {
     "NESTParallel": "nonlinearexplicitstaticparallel:NESTParallel",
     "NEDParallel": "nonlinearexplicitdynamicparallel:NEDParallel",
     "NISTPArcLength": "nonlinearimplicitstaticparallelarclength:NISTPArcLength",
+    "BeamSection": "beamsection:BeamSection",
 }.items():
     _BUILTINS[("solver", _solverName.casefold())] = f"edelweissfe.solvers.{_target}"
 
@@ -352,6 +354,12 @@ for _elementTypeName in [
 ]:
     _BUILTINS[("element", _elementTypeName.casefold())] = (
         "edelweissfe.elements.displacementtlelement.element:DisplacementTLElement"
+    )
+
+# The cross section elements carry their own interpolation table (not `elLibrary`).
+for _elementTypeName in ["WARP2D2", "WARP2D3", "WARP2D4", "WARP2D6", "WARP2D8", "WARP2D9"]:
+    _BUILTINS[("element", _elementTypeName.casefold())] = (
+        "edelweissfe.elements.beamsectionelement.element:BeamSectionElement"
     )
 
 # The material category covers the `provider=edelweiss` materials, one module and one class name per

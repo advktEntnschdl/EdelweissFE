@@ -55,6 +55,8 @@ phenomena = {
     "plastic multiplier": "scalar",
     "pressure": "scalar",
     "jacobi": "scalar",
+    "warping": "scalar",
+    "shear deformation": "scalar",
 }
 
 
@@ -88,6 +90,8 @@ inertiaKind = {
     "plastic multiplier": "non-mechanical",
     "pressure": "non-mechanical",
     "jacobi": "non-mechanical",
+    "warping": "non-mechanical",
+    "shear deformation": "non-mechanical",
 }
 
 
@@ -105,6 +109,8 @@ fieldCorrectionTolerance = {
     "plastic multiplier": 1e-8,
     "pressure": 1e-8,
     "jacobi": 1e-8,
+    "warping": 1e-8,
+    "shear deformation": 1e-8,
 }
 
 fluxResidualTolerance = {
@@ -120,6 +126,8 @@ fluxResidualTolerance = {
     "plastic multiplier": 1e-8,
     "pressure": 1e-8,
     "jacobi": 1e-8,
+    "warping": 1e-8,
+    "shear deformation": 1e-8,
 }
 
 fluxResidualToleranceAlternative = {
@@ -135,6 +143,8 @@ fluxResidualToleranceAlternative = {
     "plastic multiplier": 5e-3,
     "pressure": 5e-3,
     "jacobi": 5e-3,
+    "warping": 5e-3,
+    "shear deformation": 5e-3,
 }
 
 # domain                 dimensions
