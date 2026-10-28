@@ -155,6 +155,8 @@ class BeamSection(NonlinearSolverBase):
             indices = np.array([nodeField.indexOfNode(node) for node in self.analysis.nodes])
             nodeField["U"][indices, 0] = values
 
+        model.advanceToTime(timeStep.totalTime)
+
     def endStep(self, step, model: FEModel):
         pass
 
