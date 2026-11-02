@@ -75,7 +75,7 @@ class NISTPArcLengthSchema(NISTParallel.schema):
 class NISTPArcLength(NISTParallel):
     identification = "NISTPArcLength"
 
-    supportsMPC = False
+    supportsMPC = True
 
     #: Option schema for this solver, per OptionSchemaProvider.
     schema = NISTPArcLengthSchema
@@ -286,6 +286,7 @@ class NISTPArcLength(NISTParallel):
 
         P_0 = self.theDofManager.constructDofVector()
         P_f = self.theDofManager.constructDofVector()
+        PConstraints = self.theDofManager.constructDofVector()
         K_f = self.theDofManager.constructVIJSystemMatrix()
         K_0 = self.theDofManager.constructVIJSystemMatrix()
         U_np = self.theDofManager.constructDofVector()
@@ -313,7 +314,7 @@ class NISTPArcLength(NISTParallel):
                 U_np[:] = U_n
                 U_np += dU
 
-                P[:] = F[:] = FConstraints[:] = P_0[:] = P_f[:] = 0.0
+                P[:] = F[:] = FConstraints[:] = P_0[:] = P_f[:] = PConstraints[:] = 0.0
 
                 # the tangents hold the entries of all element matrices, far too many to zero on a single thread
                 def zeroTangents(s):
@@ -322,7 +323,10 @@ class NISTPArcLength(NISTParallel):
                 forEachSliceInParallel(zeroTangents, len(K))
 
             P, K, F = self.computeElements(model.elements, U_np, dU, P, K, F, timeStep)
-            P, K = self.assembleConstraints(model.constraints, U_np, dU, P, K, timeStep, FConstraints)
+            # the constraint forces are external loads, as in NIST; P stays the internal forces of the elements
+            PConstraints, K = self.assembleConstraints(
+                model.constraints, U_np, dU, PConstraints, K, timeStep, FConstraints
+            )
 
             P_0, K_0 = self.assembleLoads(
                 nodeForces, distributedLoads, bodyForces, U_np, P_0, K_0, zeroTimeStep
@@ -341,8 +345,14 @@ class NISTPArcLength(NISTParallel):
             K_f -= K_0
 
             # Dead and Reference load ..
-            R_0[:] = P_0 + (Lambda + dLambda) * P_f - P
+            R_0[:] = P_0 + (Lambda + dLambda) * P_f + PConstraints - P
             R_f[:] = P_f
+
+            # multi-point constraints (e.g. hanging nodes), condensed before the Dirichlet handling as in NIST; the
+            # reference load carries no constraint drift, so its slave rows vanish
+            if self.mpcTransformation is not None:
+                R_0[:] = self.mpcTransformation.transformResidual(R_0, dU)
+                R_f[:] = self.mpcTransformation.transformResidual(R_f, np.zeros_like(dU))
 
             # add stiffness contribution
             K[:] += K_0
@@ -385,7 +395,10 @@ class NISTPArcLength(NISTParallel):
             K_ = self.assembleStiffnessCSR(K)
             if hasattr(self.arcLengthController, "setSystemState"):
                 # before the Dirichlet BCs overwrite the rows of the constrained DOFs
-                self.arcLengthController.setSystemState(P, uHat, Lambda, dLambda, K_)
+                # the reactions at the constrained DOFs include those of the constraints (e.g. at a reference point)
+                self.arcLengthController.setSystemState(P - PConstraints, uHat, Lambda, dLambda, K_)
+            if self.mpcTransformation is not None:
+                K_ = self.mpcTransformation.transformSystemMatrix(K_)
             # identity rows, and the columns eliminated into both right-hand sides R_0 and R_f
             K_ = self.applyDirichletToStiffness(K_, dirichlets, R_)
 
@@ -394,6 +407,10 @@ class NISTPArcLength(NISTParallel):
             # q_0 = K⁻¹ * (  Pext_0  + dLambda * Pext_Ref - PInt  )
             # q_f = K⁻¹ * (  Pext_Ref  )
             ddU_0, ddU_f = ddU_[:, 0], ddU_[:, 1]
+            # the condensed solves return only the drift correction at the slave DOFs
+            if self.mpcTransformation is not None:
+                ddU_0 = self.mpcTransformation.recoverSlaveSolution(np.ascontiguousarray(ddU_0))
+                ddU_f = self.mpcTransformation.recoverSlaveSolution(np.ascontiguousarray(ddU_f))
 
             # compute the increment of the load parameter. Method depends on the employed arc length controller
             ddLambda = self.arcLengthController.computeDDLambda(dU, ddU_0, ddU_f, timeStep, self.theDofManager)
@@ -407,7 +424,7 @@ class NISTPArcLength(NISTParallel):
             iterationCounter += 1
 
         if hasattr(self.arcLengthController, "setSystemState"):
-            self.arcLengthController.setSystemState(P, uHat, Lambda, dLambda)
+            self.arcLengthController.setSystemState(P - PConstraints, uHat, Lambda, dLambda)
 
         self.Lambda += dLambda
         self.dLambda = dLambda
