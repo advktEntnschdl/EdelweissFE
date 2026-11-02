@@ -127,6 +127,16 @@ class StepAction(StepActionBase):
     #: Maximum ratio of predicted and last increments, against a nearly vanishing last increment.
     maxPredictorRatio = 10.0
 
+    #: Carried from one increment to the next: the dissipation at the start of the increment and the last accepted
+    #: increment (predictor, increment size); F and dLambda are set again in every iteration by setSystemState.
+    checkpointedState = {
+        "D_n": float,
+        "dLambdaLast": float,
+        "dDLast": float,
+        "dUNormLast": float,
+        "dULast": np.ndarray,
+    }
+
     def __init__(
         self,
         name: str,
