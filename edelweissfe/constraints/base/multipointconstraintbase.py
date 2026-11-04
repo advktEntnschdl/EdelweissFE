@@ -69,6 +69,11 @@ class MultiPointConstraintBase(OptionSchemaProvider, ABC):
     #: (its record is then dropped). If False (e.g. hanging nodes), a dropped record is an error.
     mayYieldSlaveToEarlierClaim: bool = True
 
+    #: How explicit dynamics folds the lumped slave masses onto the masters: ``"rowSum"`` (row-sum
+    #: lumping of :math:`T^T M T`, mass-conserving for interpolation weights) or ``"diagonal"`` (its
+    #: diagonal, for coefficients that are lever arms rather than weights, e.g. a rigid body rotation).
+    lumpedMassFolding: str = "rowSum"
+
     @classmethod
     def fromConstraintDefinition(
         cls, name: str, definition: dict, model: FEModel, journal: "Journal" = None

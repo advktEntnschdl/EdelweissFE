@@ -945,10 +945,19 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
         if not records:
             return None
 
+        # slaves whose lumped mass explicit dynamics folds by the diagonal of T^T M T
+        diagonalMassFoldSlaveDofs = frozenset(
+            record[0]
+            for mpc in model.multiPointConstraints.values()
+            if mpc.lumpedMassFolding == "diagonal"
+            for record in mpc.getMultiPointConstraints(self.theDofManager)
+        )
+
         transformation = MultiPointConstraintTransformation(
             records,
             self.theDofManager.nDof,
             useThreadedCondensation=self.options.get("useThreadedMPCCondensation", False),
+            diagonalMassFoldSlaveDofs=diagonalMassFoldSlaveDofs,
         )
 
         self.journal.message(

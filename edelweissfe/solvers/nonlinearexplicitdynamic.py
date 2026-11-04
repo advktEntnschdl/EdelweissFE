@@ -1292,8 +1292,15 @@ class NED(NonlinearSolverBase):
                 )
             )
 
+        # The operators as seen after the multi-point-constraint fold, but with the slaves keeping their
+        # own: a master without own inertia (e.g. a rigid body reference point) gets the folded one.
+        inertiaSeen, dampingSeen = M, damping
+        if self.mpcTransformation is not None:
+            inertiaSeen = M + self.mpcTransformation.foldedSlaveMasses(M)
+            dampingSeen = damping + self.mpcTransformation.foldedSlaveMasses(damping)
+
         # A field with an inertia is second order, one with only a damping first order.
-        self.firstOrderFields, self.secondOrderFields = self._classifyFieldsByScheme(M, damping)
+        self.firstOrderFields, self.secondOrderFields = self._classifyFieldsByScheme(inertiaSeen, dampingSeen)
 
         self.ids_1st = self._dofIndicesOfFields(self.firstOrderFields)
         self.ids_2nd = self._dofIndicesOfFields(self.secondOrderFields)
@@ -1321,35 +1328,37 @@ class NED(NonlinearSolverBase):
         # First-order fields integrate C * rate = P, so from here on M is "the divisor": the inertia at
         # second-order DOFs, the damping at first-order ones.
         M[self.ids_1st] = damping[self.ids_1st]
+        divisorSeen = np.array(inertiaSeen)
+        divisorSeen[self.ids_1st] = np.asarray(dampingSeen)[self.ids_1st]
 
         # Kept before folding, so the kinetic energy diagnostic accounts for the true velocities of
         # all nodes (including tied slaves) rather than master-placed folded mass.
         self._rawLumpedMass = M.copy()
 
         # compute inverses
-        if np.any(M == 0.0):
+        if np.any(divisorSeen == 0.0):
             raise ValueError(
                 "Zero found in the vector the increment divides by, at {:} of {:} degrees of freedom. "
                 "Every FIELD is covered by the classification above, which refuses a field carrying "
                 "neither coefficient, so what is left here are degrees of freedom belonging to no field "
                 "-- scalar variables, which this solver has no equation of motion for.".format(
-                    int(np.count_nonzero(np.asarray(M) == 0.0)), M.shape[0]
+                    int(np.count_nonzero(divisorSeen == 0.0)), M.shape[0]
                 )
             )
 
         # A negative lumped mass (e.g. row-summed quadratic elements) would integrate backwards in time.
-        if np.any(M < 0.0):
+        if np.any(divisorSeen < 0.0):
             raise ValueError(
                 "Negative coefficient found in {:} of {:} entries of the vector the increment "
                 "divides by (smallest: {:e}). It is a lumped inertia at a second-order degree of "
                 "freedom and a damping at a first-order one; either way a negative value makes the "
                 "explicit update integrate backwards in time there.".format(
-                    int(np.count_nonzero(M < 0.0)), M.shape[0], M.min()
+                    int(np.count_nonzero(divisorSeen < 0.0)), M.shape[0], divisorSeen.min()
                 )
             )
 
         # Slave DOFs of multi-point constraints carry no own inertia: their mass is folded onto
-        # their masters (row-sum lumping of T^T M T, mass-conserving), their Minv stays zero, and
+        # their masters (lumping of T^T M T, see MultiPointConstraintBase.lumpedMassFolding), their Minv stays zero, and
         # their kinematics are assigned directly from the masters each increment.
         if self.mpcTransformation is not None:
             self.mpcTransformation.foldLumpedMass(M)

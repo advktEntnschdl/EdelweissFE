@@ -161,6 +161,10 @@ class MultiPointConstraintTransformation:
         slave columns, the slave rows apart from their diagonal) become stored zeros, which
         :meth:`~edelweissfe.solvers.nonlinearimplicitstatic.NIST.applyDirichletToStiffness` prunes
         from a copy if ``pruneCondensedMatrixZeros`` says so.
+    diagonalMassFoldSlaveDofs
+        The slave DOFs whose lumped mass :meth:`foldLumpedMass` folds by the diagonal of
+        :math:`T^T M T` (squared coefficients) instead of its row sum; see
+        :attr:`~edelweissfe.constraints.base.multipointconstraintbase.MultiPointConstraintBase.lumpedMassFolding`.
     """
 
     def __init__(
@@ -168,6 +172,7 @@ class MultiPointConstraintTransformation:
         records: list[tuple[int, list[tuple[int, float]]]],
         nDof: int,
         useThreadedCondensation: bool = False,
+        diagonalMassFoldSlaveDofs: frozenset = frozenset(),
     ):
         slaveDofs = [slaveDof for slaveDof, _ in records]
 
@@ -194,6 +199,14 @@ class MultiPointConstraintTransformation:
                 wCols.append(masterDof)
                 wVals.append(coefficient)
         self._W = csr_matrix((wVals, (wRows, wCols)), shape=(len(self.slaveDofIndices), nDof))
+
+        # mass folding weights: W, squared in the rows of slaves folded by the diagonal of T^T M T
+        self._WMass = self._W
+        diagonalRows = np.isin(self.slaveDofIndices, list(diagonalMassFoldSlaveDofs))
+        if diagonalRows.any():
+            self._WMass = self._W.copy()
+            rowOfEntry = np.repeat(np.arange(self._W.shape[0]), np.diff(self._W.indptr))
+            self._WMass.data[diagonalRows[rowOfEntry]] **= 2
 
         # T: identity on independent DOFs, slave rows carrying the master weights, slave columns zero.
         independentDofs = np.setdiff1d(np.arange(nDof, dtype=int), self.slaveDofIndices, assume_unique=True)
@@ -427,7 +440,8 @@ class MultiPointConstraintTransformation:
         """Fold the slave masses onto their masters (in place): :math:`M_{m_a} \\mathrel{+}= N_a
         M_s`, then :math:`M_s = 0` -- the row-sum lumping of :math:`T^T M T`, which keeps the mass
         vector diagonal and conserves total mass for interpolation-type constraints
-        (:math:`\\sum_a N_a = 1`).
+        (:math:`\\sum_a N_a = 1`); its diagonal (:math:`N_a^2 M_s`) for the slaves of
+        ``diagonalMassFoldSlaveDofs``.
 
         Parameters
         ----------
@@ -435,9 +449,27 @@ class MultiPointConstraintTransformation:
             The lumped (diagonal) mass vector, modified in place.
         """
 
-        foldedSlaveMasses = self._W.T @ M[self.slaveDofIndices]
+        foldedSlaveMasses = self.foldedSlaveMasses(M)
         M[self.slaveDofIndices] = 0.0
         M += foldedSlaveMasses
+
+    def foldedSlaveMasses(self, M: np.ndarray) -> np.ndarray:
+        """The slave masses as :meth:`foldLumpedMass` adds them to the masters, without modifying
+        ``M``: :math:`N_a M_s`, or :math:`N_a^2 M_s` for the slaves folded by the diagonal of
+        :math:`T^T M T`.
+
+        Parameters
+        ----------
+        M
+            The lumped (diagonal) mass vector.
+
+        Returns
+        -------
+        np.ndarray
+            The mass contribution to every DOF, of shape ``(nDof,)``.
+        """
+
+        return self._WMass.T @ np.asarray(M)[self.slaveDofIndices]
 
     def foldExplicitForce(self, P: np.ndarray) -> np.ndarray:
         """Fold the nodal forces acting on slave DOFs onto their masters:

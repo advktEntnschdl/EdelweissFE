@@ -1,0 +1,44 @@
+** explicit-dynamics (NED) smoke test of linearizedRigidBodyMPC: a CPE4 block, fixed at the bottom,
+** its top edge a rigid body with the reference point above the block. The RP is pushed down and
+** sideways by a Dirichlet ramp, its rotation is free, so the folded inertia of the RP enters the
+** central difference update.
+*material, name=LinearElastic, id=linearelastic, provider=edelweiss
+100, 0.0, 1.0
+
+*job, name=rigidbodyned, domain=2d
+*solver, solver=NED, name=theSolver
+output-frequency=10
+
+*modelGenerator, generator=planeRectQuad, name=gen
+nX      =4
+nY      =4
+x0      =0
+y0      =0
+l       =1
+h       =1
+elType  =CPE4
+elProvider =edelweiss
+
+*node, nSet=RP
+999999, 0.5, 1.5
+
+*section, name=section1, thickness=1.0, material=linearelastic, type=plane
+gen_all
+
+*constraint, type=linearizedRigidBodyMPC, name=rigidTop
+nSet=gen_top
+referencePoint=RP
+
+*fieldOutput
+>>perNode, elSet=gen_all, field=displacement, result=U, name=disp
+>>perNode, name=RPRotation, nSet=RP, field=rotation, result=U, f(x)='x[0,0]'
+>>perNode, name=RFBottom, nSet=gen_bottom, field=displacement, result=P, f(x)='sum(x[:,1])', saveHistory=True
+
+*output, type=monitor, name=monitor
+fieldOutput=RFBottom
+fieldOutput=RPRotation
+
+*step, type=adaptiveForExplicitSimulations, solver=theSolver
+maxInc=1e0, minInc=1e-2, maxNumInc=10000, maxIter=25, stepLength=1
+>>dirichlet, name=fixBottom, nSet=gen_bottom, field=displacement, 1=0, 2=0
+>>dirichlet, name=pushRP, nSet=RP, field=displacement, 1=0.02, 2=-0.05

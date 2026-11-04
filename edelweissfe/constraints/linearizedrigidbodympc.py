@@ -53,12 +53,14 @@ This constraint is a :class:`~edelweissfe.models.meshdependent.MeshDependent`: i
 changes the slave node set (e.g. by :mod:`~edelweissfe.modelmodifiers.adaptivity.hadaptivity`), the
 records are rebuilt from the current members, so new nodes are tied as well.
 
-Limitation: static solvers only. The RP carries no mass of its own, and both dynamic solvers check
-the assembled inertia before the multi-point constraint enters, so they reject the RP's degrees of
-freedom (NID: no mass on a time-integrated DOF, as for
-:mod:`~edelweissfe.constraints.linearizedrigidbody`; NED: an inertia on only some DOFs of a field).
-For NED, folding the slave masses onto the RP would not suffice: the row-sum lumping used for ties
-gives the RP rotation the signed static moment of the slave masses instead of a rotational inertia.
+In explicit dynamics (NED), the RP carries no inertia of its own: the slave masses are folded onto
+it by the diagonal of :math:`T^T M T`, which gives the total mass on the RP displacement and the
+rotational inertia :math:`\\sum_s m_s |\\mathbf{d}_s|^2` (2D: about z) on the RP rotation, the
+coupling of both lumped away.
+
+Limitation: no implicit dynamics. NID checks the assembled mass before the multi-point constraint
+enters and rejects the massless RP degrees of freedom, as for
+:mod:`~edelweissfe.constraints.linearizedrigidbody`.
 """
 
 from dataclasses import dataclass
@@ -107,6 +109,9 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
 
     # nothing else ties a slave to the rigid body, so no other constraint may take it over
     mayYieldSlaveToEarlierClaim = False
+
+    # lumped RP inertia sum(m_s) and sum(m_s |d_s|^2); a row sum would give the signed static moment
+    lumpedMassFolding = "diagonal"
 
     def __init__(
         self,

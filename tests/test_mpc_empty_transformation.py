@@ -12,6 +12,7 @@ from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
 
 class _FakeConstraint:
     mayYieldSlaveToEarlierClaim = True
+    lumpedMassFolding = "rowSum"
 
     def __init__(self, records):
         self._records = records
